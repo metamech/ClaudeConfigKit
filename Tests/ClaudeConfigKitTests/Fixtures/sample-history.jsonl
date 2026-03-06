@@ -1,0 +1,5 @@
+{"session_id":"sess-001","timestamp":1708769160000,"type":"user","content":"Hello, how can I help?"}
+{"session_id":"sess-001","timestamp":1708769165000,"type":"assistant","model":"claude-opus-4-6","content":"I'm ready to assist with coding tasks.","input_tokens":100,"output_tokens":50}
+{"session_id":"sess-001","timestamp":1708769170000,"type":"user","content":"Create a test file"}
+{"session_id":"sess-002","timestamp":1708769175000,"type":"user","content":"Start new session"}
+{"session_id":"sess-002","timestamp":1708769180000,"type":"assistant","model":"claude-sonnet-4-6","content":"Session started.","input_tokens":80,"output_tokens":40}

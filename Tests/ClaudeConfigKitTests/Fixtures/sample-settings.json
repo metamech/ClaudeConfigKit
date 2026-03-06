@@ -1,0 +1,61 @@
+{
+  "permissions": {
+    "Bash": {
+      "decision": "deny"
+    },
+    "Read": {
+      "decision": "allow"
+    }
+  },
+  "env": {
+    "NODE_ENV": "development",
+    "DEBUG": "true",
+    "CUSTOM_VAR": "custom_value"
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/validate-bash.sh",
+            "timeout": 10,
+            "async": false
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "Review the tool usage",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/post-tool.sh",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "Read|Glob|Grep",
+        "hooks": [
+          {
+            "type": "agent",
+            "async": true
+          }
+        ]
+      }
+    ]
+  }
+}
