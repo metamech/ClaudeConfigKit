@@ -88,9 +88,35 @@ struct SchemaExtractorTests {
         #expect(schema.keyPaths["key"] == .null)
     }
 
+    @Test("JSON schema tree is populated")
+    func jsonSchemaTree() throws {
+        let json = """
+        {"name": "test", "nested": {"count": 42}, "items": [1, 2]}
+        """.data(using: .utf8)!
+
+        let schema = try SchemaExtractor.extractJSON(from: json)
+        #expect(schema.tree != nil)
+
+        if case let .object(root) = schema.tree {
+            #expect(root["name"] == .string)
+            if case let .object(nested) = root["nested"] {
+                #expect(nested["count"] == .number)
+            } else {
+                Issue.record("Expected nested to be .object")
+            }
+            if case let .array(element) = root["items"] {
+                #expect(element == .number)
+            } else {
+                Issue.record("Expected items to be .array")
+            }
+        } else {
+            Issue.record("Expected root to be .object")
+        }
+    }
+
     // MARK: - Markdown extraction
 
-    @Test("Extract Markdown headings")
+    @Test("Extract Markdown headings with levels")
     func extractMarkdownHeadings() {
         let markdown = """
         # Title
@@ -104,10 +130,10 @@ struct SchemaExtractorTests {
 
         let schema = SchemaExtractor.extractMarkdown(from: markdown)
         #expect(schema.headings.count == 4)
-        #expect(schema.headings[0] == "Title")
-        #expect(schema.headings[1] == "Section 1")
-        #expect(schema.headings[2] == "Subsection")
-        #expect(schema.headings[3] == "Section 2")
+        #expect(schema.headings[0] == Heading(level: 1, text: "Title"))
+        #expect(schema.headings[1] == Heading(level: 2, text: "Section 1"))
+        #expect(schema.headings[2] == Heading(level: 3, text: "Subsection"))
+        #expect(schema.headings[3] == Heading(level: 2, text: "Section 2"))
         #expect(schema.fingerprint.count == 64)
     }
 
@@ -127,5 +153,20 @@ struct SchemaExtractorTests {
     func emptyMarkdown() {
         let schema = SchemaExtractor.extractMarkdown(from: "No headings here.\nJust plain text.")
         #expect(schema.headings.isEmpty)
+    }
+
+    @Test("YAML frontmatter detection")
+    func yamlFrontMatter() {
+        let mdWithFrontMatter = "---\ntitle: Test\nauthor: Me\n---\n# Hello"
+        let mdWithout = "# Hello\nNo frontmatter here"
+        let mdPartial = "---\nno closing delimiter"
+
+        let schema1 = SchemaExtractor.extractMarkdown(from: mdWithFrontMatter)
+        let schema2 = SchemaExtractor.extractMarkdown(from: mdWithout)
+        let schema3 = SchemaExtractor.extractMarkdown(from: mdPartial)
+
+        #expect(schema1.hasYAMLFrontMatter == true)
+        #expect(schema2.hasYAMLFrontMatter == false)
+        #expect(schema3.hasYAMLFrontMatter == false)
     }
 }

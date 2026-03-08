@@ -41,8 +41,8 @@ struct BaselineEngineTests {
         let baseline = try await engine.captureBaseline(for: url)
 
         #expect(baseline.schema.headings.count == 2)
-        #expect(baseline.schema.headings[0] == "Title")
-        #expect(baseline.schema.headings[1] == "Section")
+        #expect(baseline.schema.headings[0] == Heading(level: 1, text: "Title"))
+        #expect(baseline.schema.headings[1] == Heading(level: 2, text: "Section"))
     }
 
     // MARK: - Detect changes
