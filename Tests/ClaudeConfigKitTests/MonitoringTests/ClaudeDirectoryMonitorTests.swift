@@ -278,4 +278,96 @@ struct ClaudeDirectoryMonitorTests {
 
         await monitor.stopMonitoring()
     }
+
+    // MARK: - Configurable debounce
+
+    @Test("Monitor accepts custom debounce interval")
+    @MainActor
+    func customDebounceInterval() async throws {
+        let tempDir = createTempDirectory()
+        defer { cleanupTempDirectory(tempDir) }
+
+        let state = ClaudeDirectoryState()
+        let monitor = ClaudeDirectoryMonitor(
+            directoryState: state,
+            claudeDirectory: tempDir,
+            debounceInterval: .milliseconds(100)
+        )
+
+        await monitor.startMonitoring()
+        let isMonitoring = await monitor.isMonitoring
+        #expect(isMonitoring == true)
+        await monitor.stopMonitoring()
+    }
+
+    // MARK: - Multi-path monitoring
+
+    @Test("Monitor supports multi-path init")
+    @MainActor
+    func multiPathInit() async throws {
+        let tempDir1 = createTempDirectory()
+        let tempDir2 = createTempDirectory()
+        defer {
+            cleanupTempDirectory(tempDir1)
+            cleanupTempDirectory(tempDir2)
+        }
+
+        let state = ClaudeDirectoryState()
+        let monitor = ClaudeDirectoryMonitor(
+            directoryState: state,
+            monitoredPaths: [tempDir1, tempDir2]
+        )
+
+        await monitor.startMonitoring()
+        let isMonitoring = await monitor.isMonitoring
+        #expect(isMonitoring == true)
+        await monitor.stopMonitoring()
+    }
+
+    @Test("updatePaths reinstalls stream")
+    @MainActor
+    func updatePathsReinstallsStream() async throws {
+        let tempDir1 = createTempDirectory()
+        let tempDir2 = createTempDirectory()
+        defer {
+            cleanupTempDirectory(tempDir1)
+            cleanupTempDirectory(tempDir2)
+        }
+
+        let state = ClaudeDirectoryState()
+        let monitor = ClaudeDirectoryMonitor(
+            directoryState: state,
+            claudeDirectory: tempDir1
+        )
+
+        await monitor.startMonitoring()
+        var isMonitoring = await monitor.isMonitoring
+        #expect(isMonitoring == true)
+
+        await monitor.updatePaths([tempDir2])
+        isMonitoring = await monitor.isMonitoring
+        #expect(isMonitoring == true)
+
+        await monitor.stopMonitoring()
+    }
+
+    // MARK: - Raw event stream
+
+    @Test("fileEvents property is accessible")
+    @MainActor
+    func fileEventsAccessible() async throws {
+        let tempDir = createTempDirectory()
+        defer { cleanupTempDirectory(tempDir) }
+
+        let state = ClaudeDirectoryState()
+        let monitor = ClaudeDirectoryMonitor(
+            directoryState: state,
+            claudeDirectory: tempDir
+        )
+
+        // Just verify we can access the stream property without crashing
+        let _: AsyncStream<[FileChangeEvent]> = monitor.fileEvents
+        await monitor.startMonitoring()
+        await monitor.stopMonitoring()
+    }
 }

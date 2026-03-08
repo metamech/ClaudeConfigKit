@@ -12,14 +12,15 @@ import Logging
 /// executor.  The C callback calls a `nonisolated` bridge method that schedules
 /// a `Task` — the task then hops onto the actor to do real work.
 ///
-/// A 500 ms debounce coalesces rapid bursts of change events into a single
-/// parse pass.
+/// A configurable debounce coalesces rapid bursts of change events into a single
+/// parse pass. Multi-path monitoring is supported.
 public actor ClaudeDirectoryMonitor: CodingAgentDirectoryMonitor {
 
     // MARK: - Private state
 
     private let directoryState: ClaudeDirectoryState
-    private let claudeDirectory: URL
+    private var monitoredPaths: [URL]
+    private let debounceInterval: Duration
 
     public private(set) var isMonitoring: Bool = false
 
@@ -28,21 +29,70 @@ public actor ClaudeDirectoryMonitor: CodingAgentDirectoryMonitor {
     private var debounceTask: Task<Void, Never>?
     private var parseErrors: [ClaudeDirectoryError] = []
 
+    private var fileEventContinuation: AsyncStream<[FileChangeEvent]>.Continuation?
+    private let _fileEvents: AsyncStream<[FileChangeEvent]>
+
     private static let logger = Logger(label: "com.metamech.ClaudeConfigKit.ClaudeDirectoryMonitor")
 
     // MARK: - Init
 
+    /// Creates a monitor watching the given paths with the specified debounce interval.
+    ///
+    /// - Parameters:
+    ///   - directoryState: The state object to publish parsed results to.
+    ///   - monitoredPaths: Directories to monitor. Defaults to `[~/.claude]`.
+    ///   - debounceInterval: How long to wait before coalescing events. Defaults to 500ms.
     public init(
         directoryState: ClaudeDirectoryState,
-        claudeDirectory: URL? = nil
+        monitoredPaths: [URL]? = nil,
+        debounceInterval: Duration = .milliseconds(500)
     ) {
         self.directoryState = directoryState
-        self.claudeDirectory = claudeDirectory
-            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".claude")
+        self.monitoredPaths = monitoredPaths
+            ?? [URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".claude")]
+        self.debounceInterval = debounceInterval
         self.callbackQueue = DispatchQueue(
             label: "com.metamech.ClaudeConfigKit.ClaudeDirectoryMonitor",
             qos: .utility
         )
+
+        var continuation: AsyncStream<[FileChangeEvent]>.Continuation!
+        self._fileEvents = AsyncStream { continuation = $0 }
+        self.fileEventContinuation = continuation
+    }
+
+    /// Convenience init for single-directory monitoring.
+    public init(
+        directoryState: ClaudeDirectoryState,
+        claudeDirectory: URL?,
+        debounceInterval: Duration = .milliseconds(500)
+    ) {
+        let dir = claudeDirectory
+            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".claude")
+        self.init(
+            directoryState: directoryState,
+            monitoredPaths: [dir],
+            debounceInterval: debounceInterval
+        )
+    }
+
+    // MARK: - Public API
+
+    /// An `AsyncStream` of raw file change events, yielded before debounce.
+    public nonisolated var fileEvents: AsyncStream<[FileChangeEvent]> {
+        _fileEvents
+    }
+
+    /// Update the monitored paths at runtime. Tears down and reinstalls the FSEvents stream.
+    public func updatePaths(_ paths: [URL]) async {
+        let wasMonitoring = isMonitoring
+        if wasMonitoring {
+            await stopMonitoring()
+        }
+        monitoredPaths = paths
+        if wasMonitoring {
+            await startMonitoring()
+        }
     }
 
     // MARK: - CodingAgentDirectoryMonitor
@@ -50,16 +100,20 @@ public actor ClaudeDirectoryMonitor: CodingAgentDirectoryMonitor {
     public func startMonitoring() async {
         guard !isMonitoring else { return }
 
-        guard FileManager.default.fileExists(atPath: claudeDirectory.path) else {
-            Self.logger.warning("~/.claude not found at \(self.claudeDirectory.path) — monitoring skipped")
+        let validPaths = monitoredPaths.filter { url in
+            FileManager.default.fileExists(atPath: url.path)
+        }
+
+        guard !validPaths.isEmpty else {
+            Self.logger.warning("No monitored paths exist — monitoring skipped")
             return
         }
 
-        installFSEventStream()
+        installFSEventStream(paths: validPaths)
         isMonitoring = (eventStream != nil)
 
         if isMonitoring {
-            Self.logger.info("Started monitoring \(self.claudeDirectory.path)")
+            Self.logger.info("Started monitoring \(validPaths.map(\.path))")
             await runParsePass()
         }
     }
@@ -72,14 +126,15 @@ public actor ClaudeDirectoryMonitor: CodingAgentDirectoryMonitor {
 
         teardownFSEventStream()
         isMonitoring = false
+        fileEventContinuation?.finish()
 
-        Self.logger.info("Stopped monitoring \(self.claudeDirectory.path)")
+        Self.logger.info("Stopped monitoring")
     }
 
     // MARK: - FSEvents stream
 
-    private func installFSEventStream() {
-        let pathsToWatch = [claudeDirectory.path] as CFArray
+    private func installFSEventStream(paths: [URL]) {
+        let pathsToWatch = paths.map(\.path) as CFArray
 
         let selfPtr = Unmanaged.passRetained(self as AnyObject).toOpaque()
 
@@ -103,7 +158,7 @@ public actor ClaudeDirectoryMonitor: CodingAgentDirectoryMonitor {
 
         let stream = FSEventStreamCreate(
             kCFAllocatorDefault,
-            { _, info, numEvents, eventPaths, _, _ in
+            { _, info, numEvents, eventPaths, eventFlags, _ in
                 guard let info else { return }
                 let monitor = Unmanaged<AnyObject>
                     .fromOpaque(info)
@@ -113,7 +168,15 @@ public actor ClaudeDirectoryMonitor: CodingAgentDirectoryMonitor {
                 guard let cfPaths = cfArray as? [String] else { return }
                 let paths = Array(cfPaths.prefix(numEvents))
 
-                monitor.handleFSEventsCallback(paths: paths)
+                let flagsPtr = eventFlags
+                var events: [FileChangeEvent] = []
+                let now = Date()
+                for i in 0..<numEvents {
+                    let eventFlag = EventFlags(rawValue: UInt32(flagsPtr[i]))
+                    events.append(FileChangeEvent(path: paths[i], flags: eventFlag, timestamp: now))
+                }
+
+                monitor.handleFSEventsCallback(paths: paths, events: events)
             },
             &context,
             pathsToWatch,
@@ -150,17 +213,20 @@ public actor ClaudeDirectoryMonitor: CodingAgentDirectoryMonitor {
 
     // MARK: - FSEvents → actor bridge
 
-    nonisolated func handleFSEventsCallback(paths: [String]) {
+    nonisolated func handleFSEventsCallback(paths: [String], events: [FileChangeEvent]) {
         Task {
-            await self.scheduleDebounce(paths: paths)
+            await self.scheduleDebounce(paths: paths, events: events)
         }
     }
 
-    private func scheduleDebounce(paths: [String]) {
+    private func scheduleDebounce(paths: [String], events: [FileChangeEvent]) {
+        // Yield raw events before debounce
+        fileEventContinuation?.yield(events)
+
         debounceTask?.cancel()
-        debounceTask = Task { [weak self] in
+        debounceTask = Task { [weak self, debounceInterval] in
             do {
-                try await Task.sleep(for: .milliseconds(500))
+                try await Task.sleep(for: debounceInterval)
             } catch {
                 return
             }
@@ -175,10 +241,13 @@ public actor ClaudeDirectoryMonitor: CodingAgentDirectoryMonitor {
     private func runParsePass() async {
         parseErrors.removeAll()
 
-        await parseSettings()
-        await parseStatsCache()
-        await parseSessionHistories()
-        await parsePlans()
+        // Use the first monitored path as the claude directory for parsing
+        guard let claudeDirectory = monitoredPaths.first else { return }
+
+        await parseSettings(in: claudeDirectory)
+        await parseStatsCache(in: claudeDirectory)
+        await parseSessionHistories(in: claudeDirectory)
+        await parsePlans(in: claudeDirectory)
 
         let errors = parseErrors
         let now = Date()
@@ -192,7 +261,7 @@ public actor ClaudeDirectoryMonitor: CodingAgentDirectoryMonitor {
 
     // MARK: - Individual parsers
 
-    private func parseSettings() async {
+    private func parseSettings(in claudeDirectory: URL) async {
         let url = claudeDirectory.appendingPathComponent("settings.json")
 
         guard FileManager.default.fileExists(atPath: url.path) else {
@@ -215,7 +284,7 @@ public actor ClaudeDirectoryMonitor: CodingAgentDirectoryMonitor {
         }
     }
 
-    private func parseStatsCache() async {
+    private func parseStatsCache(in claudeDirectory: URL) async {
         let url = claudeDirectory.appendingPathComponent("stats-cache.json")
 
         guard FileManager.default.fileExists(atPath: url.path) else {
@@ -237,7 +306,7 @@ public actor ClaudeDirectoryMonitor: CodingAgentDirectoryMonitor {
         }
     }
 
-    private func parseSessionHistories() async {
+    private func parseSessionHistories(in claudeDirectory: URL) async {
         let projectsURL = claudeDirectory.appendingPathComponent("projects")
 
         guard FileManager.default.fileExists(atPath: projectsURL.path) else {
@@ -277,7 +346,7 @@ public actor ClaudeDirectoryMonitor: CodingAgentDirectoryMonitor {
         }
     }
 
-    private func parsePlans() async {
+    private func parsePlans(in claudeDirectory: URL) async {
         let projectsURL = claudeDirectory.appendingPathComponent("projects")
 
         guard FileManager.default.fileExists(atPath: projectsURL.path) else {
