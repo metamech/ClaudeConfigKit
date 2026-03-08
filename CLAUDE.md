@@ -16,11 +16,12 @@ Swift package for monitoring/parsing Claude Code configs + intelligence layer fo
 ```
 Sources/ClaudeConfigKit/
   Protocols/    — CodingAgentDirectoryMonitor, HookManagerProtocol
-  Monitoring/   — ClaudeDirectoryMonitor (FSEvents)
+  Monitoring/   — ClaudeDirectoryMonitor (FSEvents), FileChangeEvent
   Parsing/      — ClaudeSettings, ClaudeStatsCache, ClaudeSessionHistory,
-                  ClaudePlan, ClaudeDirectoryState, HookEvent
-  Intelligence/ — FileHasher, SchemaStructure, SchemaExtractor,
-                  ConfigChangeRecord, ChangeClassifier, BaselineEngine
+                  ClaudePlan, ClaudeDirectoryState, HookEvent, ConfigParser
+  Intelligence/ — FileHasher, SchemaStructure (Heading, SchemaNode),
+                  SchemaExtractor, ConfigChangeRecord, ChangeClassifier,
+                  BaselineEngine (SymlinkPolicy)
 ```
 
 ## Commands
