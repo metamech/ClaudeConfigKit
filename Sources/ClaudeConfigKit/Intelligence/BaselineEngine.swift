@@ -32,8 +32,8 @@ public actor BaselineEngine {
     public init() {}
 
     /// Capture a baseline snapshot for the file at `url`.
-    public func captureBaseline(for url: URL) throws -> ConfigBaseline {
-        let data = try Data(contentsOf: url)
+    public func captureBaseline(for url: URL) async throws -> ConfigBaseline {
+        let data = try await FileHasher.readFileData(at: url)
         let hash = FileHasher.hash(data: data)
         let schema = extractSchema(from: data, url: url)
 
@@ -48,7 +48,7 @@ public actor BaselineEngine {
     ///
     /// Returns `nil` if the file has not changed. Returns a ``ConfigChangeRecord``
     /// describing the change if one is detected.
-    public func detectChanges(for url: URL, against baseline: ConfigBaseline) throws -> ConfigChangeRecord? {
+    public func detectChanges(for url: URL, against baseline: ConfigBaseline) async throws -> ConfigChangeRecord? {
         let fileExists = FileManager.default.fileExists(atPath: url.path)
 
         if !fileExists {
@@ -61,7 +61,7 @@ public actor BaselineEngine {
             )
         }
 
-        let data = try Data(contentsOf: url)
+        let data = try await FileHasher.readFileData(at: url)
         let currentHash = FileHasher.hash(data: data)
 
         // No change
@@ -88,7 +88,8 @@ public actor BaselineEngine {
             previousFingerprint: baseline.schema.fingerprint,
             currentFingerprint: currentSchema.fingerprint,
             previousHash: baseline.contentHash,
-            currentHash: currentHash
+            currentHash: currentHash,
+            diffData: data
         )
     }
 

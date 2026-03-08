@@ -74,6 +74,9 @@ struct BaselineEngineTests {
         let change = try await engine.detectChanges(for: url, against: baseline)
         #expect(change != nil)
         #expect(change?.changeType == .dataChange)
+        #expect(change?.diffData != nil)
+        let diffString = String(data: change!.diffData!, encoding: .utf8)
+        #expect(diffString?.contains("value2") == true)
     }
 
     @Test("Schema change detected when structure changes")
@@ -107,5 +110,6 @@ struct BaselineEngineTests {
         let change = try await engine.detectChanges(for: url, against: baseline)
         #expect(change != nil)
         #expect(change?.changeType == .fileRemoved)
+        #expect(change?.diffData == nil)
     }
 }

@@ -45,6 +45,9 @@ public struct ConfigChangeRecord: Sendable, Codable {
     /// Content hash after the change (nil for file removals).
     public var currentHash: String?
 
+    /// Raw file data after the change (nil for file removals).
+    public var diffData: Data?
+
     public init(
         filePath: String,
         changeType: ChangeType,
@@ -53,7 +56,8 @@ public struct ConfigChangeRecord: Sendable, Codable {
         previousFingerprint: String? = nil,
         currentFingerprint: String? = nil,
         previousHash: String? = nil,
-        currentHash: String? = nil
+        currentHash: String? = nil,
+        diffData: Data? = nil
     ) {
         self.filePath = filePath
         self.changeType = changeType
@@ -63,5 +67,6 @@ public struct ConfigChangeRecord: Sendable, Codable {
         self.currentFingerprint = currentFingerprint
         self.previousHash = previousHash
         self.currentHash = currentHash
+        self.diffData = diffData
     }
 }
