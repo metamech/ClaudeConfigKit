@@ -347,66 +347,41 @@ public actor ClaudeDirectoryMonitor: CodingAgentDirectoryMonitor {
     }
 
     private func parsePlans(in claudeDirectory: URL) async {
-        let projectsURL = claudeDirectory.appendingPathComponent("projects")
-
-        guard FileManager.default.fileExists(atPath: projectsURL.path) else {
-            return
-        }
-
         var updatedPlans: [String: [ClaudePlan]] = [:]
 
-        do {
-            let projectDirs = try FileManager.default.contentsOfDirectory(
-                at: projectsURL,
-                includingPropertiesForKeys: [.isDirectoryKey],
-                options: .skipsHiddenFiles
-            )
+        // Scan global plans directory (~/.claude/plans/)
+        let globalPlansDir = claudeDirectory.appendingPathComponent("plans")
+        let globalPlans = scanPlansDirectory(globalPlansDir)
+        if !globalPlans.isEmpty {
+            updatedPlans["_global"] = globalPlans
+        }
 
-            for projectDir in projectDirs {
-                var isDir: ObjCBool = false
-                guard FileManager.default.fileExists(
-                    atPath: projectDir.path, isDirectory: &isDir
-                ), isDir.boolValue else { continue }
+        // Scan per-project plans directories (~/.claude/projects/*/plans/)
+        let projectsURL = claudeDirectory.appendingPathComponent("projects")
+        if FileManager.default.fileExists(atPath: projectsURL.path) {
+            do {
+                let projectDirs = try FileManager.default.contentsOfDirectory(
+                    at: projectsURL,
+                    includingPropertiesForKeys: [.isDirectoryKey],
+                    options: .skipsHiddenFiles
+                )
 
-                let plansDir = projectDir.appendingPathComponent("plans")
-                guard FileManager.default.fileExists(atPath: plansDir.path) else { continue }
+                for projectDir in projectDirs {
+                    var isDir: ObjCBool = false
+                    guard FileManager.default.fileExists(
+                        atPath: projectDir.path, isDirectory: &isDir
+                    ), isDir.boolValue else { continue }
 
-                let markdownFiles: [URL]
-                do {
-                    markdownFiles = try FileManager.default.contentsOfDirectory(
-                        at: plansDir,
-                        includingPropertiesForKeys: [.contentModificationDateKey],
-                        options: .skipsHiddenFiles
-                    ).filter { $0.pathExtension.lowercased() == "md" }
-                } catch {
-                    parseErrors.append(.parseError(plansDir.path, error))
-                    continue
-                }
-
-                var projectPlans: [ClaudePlan] = []
-                for file in markdownFiles {
-                    do {
-                        let content = try String(contentsOf: file, encoding: .utf8)
-                        let attrs = try FileManager.default.attributesOfItem(atPath: file.path)
-                        let modified = (attrs[.modificationDate] as? Date) ?? Date()
-                        projectPlans.append(
-                            ClaudePlan(
-                                filePath: file.path,
-                                content: content,
-                                lastModified: modified
-                            )
-                        )
-                    } catch {
-                        parseErrors.append(.parseError(file.path, error))
-                        Self.logger.error("Failed to read plan \(file.lastPathComponent): \(error)")
+                    let plansDir = projectDir.appendingPathComponent("plans")
+                    let projectPlans = scanPlansDirectory(plansDir)
+                    if !projectPlans.isEmpty {
+                        updatedPlans[projectDir.lastPathComponent] = projectPlans
                     }
                 }
-
-                updatedPlans[projectDir.lastPathComponent] = projectPlans
+            } catch {
+                parseErrors.append(.parseError(projectsURL.path, error))
+                Self.logger.error("Failed to enumerate projects for plans: \(error)")
             }
-        } catch {
-            parseErrors.append(.parseError(projectsURL.path, error))
-            Self.logger.error("Failed to enumerate projects for plans: \(error)")
         }
 
         let plans = updatedPlans
@@ -414,6 +389,43 @@ public actor ClaudeDirectoryMonitor: CodingAgentDirectoryMonitor {
         Task { @MainActor in
             state.plans = plans
         }
+    }
+
+    /// Scans a directory for markdown plan files and returns parsed `ClaudePlan` instances.
+    private func scanPlansDirectory(_ plansDir: URL) -> [ClaudePlan] {
+        guard FileManager.default.fileExists(atPath: plansDir.path) else { return [] }
+
+        let markdownFiles: [URL]
+        do {
+            markdownFiles = try FileManager.default.contentsOfDirectory(
+                at: plansDir,
+                includingPropertiesForKeys: [.contentModificationDateKey],
+                options: .skipsHiddenFiles
+            ).filter { $0.pathExtension.lowercased() == "md" }
+        } catch {
+            parseErrors.append(.parseError(plansDir.path, error))
+            return []
+        }
+
+        var plans: [ClaudePlan] = []
+        for file in markdownFiles {
+            do {
+                let content = try String(contentsOf: file, encoding: .utf8)
+                let attrs = try FileManager.default.attributesOfItem(atPath: file.path)
+                let modified = (attrs[.modificationDate] as? Date) ?? Date()
+                plans.append(
+                    ClaudePlan(
+                        filePath: file.path,
+                        content: content,
+                        lastModified: modified
+                    )
+                )
+            } catch {
+                parseErrors.append(.parseError(file.path, error))
+                Self.logger.error("Failed to read plan \(file.lastPathComponent): \(error)")
+            }
+        }
+        return plans
     }
 
     // MARK: - JSONL helper
