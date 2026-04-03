@@ -17,14 +17,39 @@ public struct ClaudeSettings: Codable, Sendable {
     /// Hook definitions keyed by event name (e.g. `"PreToolUse"`, `"PostToolUse"`).
     public var hooks: [String: [HookMatcherGroup]]?
 
+    /// MCP server definitions keyed by server name.
+    public var mcpServers: [String: MCPServerEntry]?
+
     public init(
         permissions: [String: PermissionSetting]? = nil,
         env: [String: String]? = nil,
-        hooks: [String: [HookMatcherGroup]]? = nil
+        hooks: [String: [HookMatcherGroup]]? = nil,
+        mcpServers: [String: MCPServerEntry]? = nil
     ) {
         self.permissions = permissions
         self.env = env
         self.hooks = hooks
+        self.mcpServers = mcpServers
+    }
+}
+
+// MARK: - MCPServerEntry
+
+/// An MCP server entry in settings.json.
+public struct MCPServerEntry: Codable, Sendable, Equatable {
+    /// Transport type (e.g. `"stdio"`).
+    public var type: String?
+
+    /// The command to execute.
+    public var command: String?
+
+    /// Optional command arguments.
+    public var args: [String]?
+
+    public init(type: String? = nil, command: String? = nil, args: [String]? = nil) {
+        self.type = type
+        self.command = command
+        self.args = args
     }
 }
 
