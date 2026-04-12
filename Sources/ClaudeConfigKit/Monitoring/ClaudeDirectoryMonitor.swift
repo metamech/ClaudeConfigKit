@@ -32,6 +32,15 @@ public actor ClaudeDirectoryMonitor: CodingAgentDirectoryMonitor {
     private var fileEventContinuation: AsyncStream<[FileChangeEvent]>.Continuation?
     private let _fileEvents: AsyncStream<[FileChangeEvent]>
 
+    /// Paths accumulated from FSEvents callbacks during the current debounce window.
+    /// Cleared after each parse pass.
+    private var pendingChangedPaths: Set<String> = []
+
+    /// Last-seen modification date per plan file URL, keyed across all scanned plan directories.
+    private var lastPlanModDates: [URL: Date] = [:]
+    /// Cached parse result per plan file URL; reused when modification date is unchanged.
+    private var cachedPlans: [URL: ClaudePlan] = [:]
+
     private static let logger = Logger(label: "com.metamech.ClaudeConfigKit.ClaudeDirectoryMonitor")
 
     // MARK: - Init
@@ -41,11 +50,11 @@ public actor ClaudeDirectoryMonitor: CodingAgentDirectoryMonitor {
     /// - Parameters:
     ///   - directoryState: The state object to publish parsed results to.
     ///   - monitoredPaths: Directories to monitor. Defaults to `[~/.claude]`.
-    ///   - debounceInterval: How long to wait before coalescing events. Defaults to 500ms.
+    ///   - debounceInterval: How long to wait before coalescing events. Defaults to 1500ms.
     public init(
         directoryState: ClaudeDirectoryState,
         monitoredPaths: [URL]? = nil,
-        debounceInterval: Duration = .milliseconds(500)
+        debounceInterval: Duration = .milliseconds(1500)
     ) {
         self.directoryState = directoryState
         self.monitoredPaths = monitoredPaths
@@ -65,7 +74,7 @@ public actor ClaudeDirectoryMonitor: CodingAgentDirectoryMonitor {
     public init(
         directoryState: ClaudeDirectoryState,
         claudeDirectory: URL?,
-        debounceInterval: Duration = .milliseconds(500)
+        debounceInterval: Duration = .milliseconds(1500)
     ) {
         let dir = claudeDirectory
             ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".claude")
@@ -223,6 +232,9 @@ public actor ClaudeDirectoryMonitor: CodingAgentDirectoryMonitor {
         // Yield raw events before debounce
         fileEventContinuation?.yield(events)
 
+        // Accumulate paths across rapid-fire callbacks within the debounce window.
+        pendingChangedPaths.formUnion(paths)
+
         debounceTask?.cancel()
         debounceTask = Task { [weak self, debounceInterval] in
             do {
@@ -244,10 +256,40 @@ public actor ClaudeDirectoryMonitor: CodingAgentDirectoryMonitor {
         // Use the first monitored path as the claude directory for parsing
         guard let claudeDirectory = monitoredPaths.first else { return }
 
-        await parseSettings(in: claudeDirectory)
-        await parseStatsCache(in: claudeDirectory)
-        await parseSessionHistories(in: claudeDirectory)
-        await parsePlans(in: claudeDirectory)
+        // Snapshot and clear the accumulated paths so the next debounce window
+        // starts clean even while this parse pass is in flight.
+        let changedPaths = pendingChangedPaths
+        pendingChangedPaths.removeAll()
+
+        // Determine which parsers to run based on the changed paths.
+        // Fall back to running all parsers when no paths are known (e.g. on
+        // startup, or if the set was cleared unexpectedly).
+        if changedPaths.isEmpty {
+            await parseSettings(in: claudeDirectory)
+            await parseStatsCache(in: claudeDirectory)
+            await parseSessionHistories(in: claudeDirectory)
+            await parsePlans(in: claudeDirectory)
+        } else {
+            let needsSettings   = changedPaths.contains { $0.hasSuffix("settings.json") }
+            let needsStats      = changedPaths.contains { $0.hasSuffix("stats-cache.json") }
+            let needsHistories  = changedPaths.contains { $0.contains("history.jsonl") }
+            let needsPlans      = changedPaths.contains { path in
+                path.contains("/plans/") && path.hasSuffix(".md")
+            }
+            // If a changed path doesn't match any known pattern, run all parsers
+            // as a safety fallback so no update is silently dropped.
+            let hasUnknown = changedPaths.contains { path in
+                !path.hasSuffix("settings.json") &&
+                !path.hasSuffix("stats-cache.json") &&
+                !path.contains("history.jsonl") &&
+                !(path.contains("/plans/") && path.hasSuffix(".md"))
+            }
+
+            if needsSettings  || hasUnknown { await parseSettings(in: claudeDirectory) }
+            if needsStats     || hasUnknown { await parseStatsCache(in: claudeDirectory) }
+            if needsHistories || hasUnknown { await parseSessionHistories(in: claudeDirectory) }
+            if needsPlans     || hasUnknown { await parsePlans(in: claudeDirectory) }
+        }
 
         let errors = parseErrors
         let now = Date()
@@ -392,12 +434,18 @@ public actor ClaudeDirectoryMonitor: CodingAgentDirectoryMonitor {
     }
 
     /// Scans a directory for markdown plan files and returns parsed `ClaudePlan` instances.
+    ///
+    /// Uses a single batch `contentsOfDirectory` call (with `.contentModificationDateKey`) to
+    /// enumerate files and their modification dates, then skips reading files whose modification
+    /// date hasn't changed since the last scan.  Fresh reads are cached so unchanged files cost
+    /// only a date comparison per debounce pass.
     private func scanPlansDirectory(_ plansDir: URL) -> [ClaudePlan] {
         guard FileManager.default.fileExists(atPath: plansDir.path) else { return [] }
 
-        let markdownFiles: [URL]
+        // Single syscall: enumerate all files plus their modification dates.
+        let allFiles: [URL]
         do {
-            markdownFiles = try FileManager.default.contentsOfDirectory(
+            allFiles = try FileManager.default.contentsOfDirectory(
                 at: plansDir,
                 includingPropertiesForKeys: [.contentModificationDateKey],
                 options: .skipsHiddenFiles
@@ -407,24 +455,53 @@ public actor ClaudeDirectoryMonitor: CodingAgentDirectoryMonitor {
             return []
         }
 
+        // Track which URLs are still present so we can evict deleted entries.
+        var seenURLs: Set<URL> = []
         var plans: [ClaudePlan] = []
-        for file in markdownFiles {
+
+        for file in allFiles {
+            seenURLs.insert(file)
+
+            // Extract the modification date from the already-fetched resource values —
+            // no extra attributesOfItem / lstat call needed.
+            let modDate: Date
+            if let values = try? file.resourceValues(forKeys: [.contentModificationDateKey]),
+               let date = values.contentModificationDate {
+                modDate = date
+            } else {
+                modDate = Date()
+            }
+
+            // Cache hit: date unchanged — reuse the previous parse result.
+            if let cached = cachedPlans[file], lastPlanModDates[file] == modDate {
+                plans.append(cached)
+                continue
+            }
+
+            // Cache miss or date changed: read and parse the file.
             do {
                 let content = try String(contentsOf: file, encoding: .utf8)
-                let attrs = try FileManager.default.attributesOfItem(atPath: file.path)
-                let modified = (attrs[.modificationDate] as? Date) ?? Date()
-                plans.append(
-                    ClaudePlan(
-                        filePath: file.path,
-                        content: content,
-                        lastModified: modified
-                    )
+                let plan = ClaudePlan(
+                    filePath: file.path,
+                    content: content,
+                    lastModified: modDate
                 )
+                cachedPlans[file] = plan
+                lastPlanModDates[file] = modDate
+                plans.append(plan)
             } catch {
                 parseErrors.append(.parseError(file.path, error))
                 Self.logger.error("Failed to read plan \(file.lastPathComponent): \(error)")
             }
         }
+
+        // Evict entries for files that no longer exist in this directory.
+        let dirsURLs = Set(lastPlanModDates.keys.filter { $0.deletingLastPathComponent() == plansDir })
+        for staleURL in dirsURLs.subtracting(seenURLs) {
+            lastPlanModDates.removeValue(forKey: staleURL)
+            cachedPlans.removeValue(forKey: staleURL)
+        }
+
         return plans
     }
 
