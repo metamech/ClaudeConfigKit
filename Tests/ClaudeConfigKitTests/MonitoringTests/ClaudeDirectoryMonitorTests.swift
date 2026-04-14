@@ -532,4 +532,223 @@ struct ClaudeDirectoryMonitorTests {
         #expect(fastIsMonitoring == true)
         await fastMonitor.stopMonitoring()
     }
+
+    // MARK: - Pause / Resume tests
+
+    @Test("pause() is idempotent when already paused")
+    @MainActor
+    func pauseIdempotentWhenAlreadyPaused() async throws {
+        let tempDir = createTempDirectory()
+        defer { cleanupTempDirectory(tempDir) }
+
+        let state = ClaudeDirectoryState()
+        let monitor = ClaudeDirectoryMonitor(
+            directoryState: state,
+            claudeDirectory: tempDir
+        )
+
+        await monitor.startMonitoring()
+        var isPaused = await monitor.isPaused
+        #expect(isPaused == false)
+
+        // First pause
+        await monitor.pause()
+        isPaused = await monitor.isPaused
+        #expect(isPaused == true)
+
+        // Second pause should be a no-op and not error
+        await monitor.pause()
+        isPaused = await monitor.isPaused
+        #expect(isPaused == true)
+
+        await monitor.stopMonitoring()
+    }
+
+    @Test("resume() is idempotent when already running")
+    @MainActor
+    func resumeIdempotentWhenAlreadyRunning() async throws {
+        let tempDir = createTempDirectory()
+        defer { cleanupTempDirectory(tempDir) }
+
+        let state = ClaudeDirectoryState()
+        let monitor = ClaudeDirectoryMonitor(
+            directoryState: state,
+            claudeDirectory: tempDir
+        )
+
+        await monitor.startMonitoring()
+        var isPaused = await monitor.isPaused
+        #expect(isPaused == false)
+
+        // resume() when not paused should be a no-op
+        await monitor.resume()
+        isPaused = await monitor.isPaused
+        #expect(isPaused == false)
+
+        // Second resume should also be a no-op
+        await monitor.resume()
+        isPaused = await monitor.isPaused
+        #expect(isPaused == false)
+
+        await monitor.stopMonitoring()
+    }
+
+    @Test("pause() before startMonitoring() is a no-op")
+    @MainActor
+    func pauseBeforeStartIsNoOp() async throws {
+        let tempDir = createTempDirectory()
+        defer { cleanupTempDirectory(tempDir) }
+
+        let state = ClaudeDirectoryState()
+        let monitor = ClaudeDirectoryMonitor(
+            directoryState: state,
+            claudeDirectory: tempDir
+        )
+
+        // pause() before monitoring has started should be a no-op
+        await monitor.pause()
+        var isMonitoring = await monitor.isMonitoring
+        var isPaused = await monitor.isPaused
+        #expect(isMonitoring == false)
+        #expect(isPaused == false)
+
+        // startMonitoring should work normally
+        await monitor.startMonitoring()
+        isMonitoring = await monitor.isMonitoring
+        isPaused = await monitor.isPaused
+        #expect(isMonitoring == true)
+        #expect(isPaused == false)
+
+        await monitor.stopMonitoring()
+    }
+
+    @Test("pause() blocks file events in watched directory")
+    @MainActor
+    func pauseBlocksFileEvents() async throws {
+        let tempDir = createTempDirectory()
+        defer { cleanupTempDirectory(tempDir) }
+
+        // Create a subdirectory to watch
+        let watchDir = tempDir.appendingPathComponent("watch-test")
+        try FileManager.default.createDirectory(at: watchDir, withIntermediateDirectories: true)
+
+        let state = ClaudeDirectoryState()
+        let monitor = ClaudeDirectoryMonitor(
+            directoryState: state,
+            claudeDirectory: watchDir,
+            debounceInterval: .milliseconds(100)
+        )
+
+        await monitor.startMonitoring()
+
+        // Give FSEvents a moment to start
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        // Pause monitoring
+        await monitor.pause()
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        // Create a file while paused — event should not be yielded
+        let testFile = watchDir.appendingPathComponent("test.txt")
+        try "test content".write(to: testFile, atomically: true, encoding: .utf8)
+
+        // Wait to see if an event comes through (should not)
+        var eventReceived = false
+        let task = Task {
+            var iterator = await monitor.fileEvents.makeAsyncIterator()
+            if let _ = try? await Task.sleep(nanoseconds: 600_000_000) {
+                // Timeout after 600ms, try to get next event
+                if let _ = try? await iterator.next() {
+                    eventReceived = true
+                }
+            }
+        }
+        // Give it time to detect (if it does)
+        try await Task.sleep(nanoseconds: 700_000_000)
+        task.cancel()
+
+        #expect(eventReceived == false)
+
+        await monitor.stopMonitoring()
+        try FileManager.default.removeItem(at: testFile)
+    }
+
+    @Test("resume() allows file events after pause")
+    @MainActor
+    func resumeAllowsFileEvents() async throws {
+        let tempDir = createTempDirectory()
+        defer { cleanupTempDirectory(tempDir) }
+
+        // Create a subdirectory to watch
+        let watchDir = tempDir.appendingPathComponent("watch-test-2")
+        try FileManager.default.createDirectory(at: watchDir, withIntermediateDirectories: true)
+
+        let state = ClaudeDirectoryState()
+        let monitor = ClaudeDirectoryMonitor(
+            directoryState: state,
+            claudeDirectory: watchDir,
+            debounceInterval: .milliseconds(100)
+        )
+
+        await monitor.startMonitoring()
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        // Pause, then resume
+        await monitor.pause()
+        try await Task.sleep(nanoseconds: 50_000_000)
+        await monitor.resume()
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        // Now create a file — event should be detected
+        let testFile = watchDir.appendingPathComponent("test2.txt")
+        try "resume test content".write(to: testFile, atomically: true, encoding: .utf8)
+
+        // Collect events for a short window
+        var eventReceived = false
+        let eventTask = Task {
+            var iterator = await monitor.fileEvents.makeAsyncIterator()
+            while !Task.isCancelled {
+                if let _ = try? await iterator.next() {
+                    eventReceived = true
+                    break
+                }
+            }
+        }
+
+        try await Task.sleep(nanoseconds: 800_000_000)
+        eventTask.cancel()
+
+        #expect(eventReceived == true)
+
+        await monitor.stopMonitoring()
+        try FileManager.default.removeItem(at: testFile)
+    }
+
+    @Test("startMonitoring() after stopMonitoring() is guarded and logs warning")
+    @MainActor
+    func startAfterStopReturnsEarly() async throws {
+        let tempDir = createTempDirectory()
+        defer { cleanupTempDirectory(tempDir) }
+
+        let state = ClaudeDirectoryState()
+        let monitor = ClaudeDirectoryMonitor(
+            directoryState: state,
+            claudeDirectory: tempDir
+        )
+
+        await monitor.startMonitoring()
+        var isMonitoring = await monitor.isMonitoring
+        #expect(isMonitoring == true)
+
+        // Stop monitoring, which nils fileEventContinuation
+        await monitor.stopMonitoring()
+        isMonitoring = await monitor.isMonitoring
+        #expect(isMonitoring == false)
+
+        // Try to start again — should be guarded and return early
+        // (The logger will emit a warning, but the call should not crash)
+        await monitor.startMonitoring()
+        isMonitoring = await monitor.isMonitoring
+        #expect(isMonitoring == false)
+    }
 }
