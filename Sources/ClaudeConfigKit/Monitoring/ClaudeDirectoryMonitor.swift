@@ -14,6 +14,16 @@ import Logging
 ///
 /// A configurable debounce coalesces rapid bursts of change events into a single
 /// parse pass. Multi-path monitoring is supported.
+///
+/// ## Pause / Resume
+///
+/// ``pause()`` tears down the FSEvents source and cancels any pending debounce
+/// work without finishing `fileEvents` — the AsyncStream and its consumer tasks
+/// remain alive across the suspension window.  ``resume()`` reinstalls the
+/// FSEvents source so events flow again.  Use these instead of
+/// ``stopMonitoring()`` / ``startMonitoring()`` whenever you want to
+/// temporarily silence the monitor (e.g. while the host application is in the
+/// background) without invalidating existing stream consumers.
 public actor ClaudeDirectoryMonitor: CodingAgentDirectoryMonitor {
 
     // MARK: - Private state
@@ -23,6 +33,11 @@ public actor ClaudeDirectoryMonitor: CodingAgentDirectoryMonitor {
     private let debounceInterval: Duration
 
     public private(set) var isMonitoring: Bool = false
+
+    /// `true` while the monitor has been paused via ``pause()`` but not yet
+    /// resumed.  The actor is still considered "monitoring" (`isMonitoring`
+    /// remains `true`) — only the FSEvents source is temporarily suspended.
+    public private(set) var isPaused: Bool = false
 
     private var eventStream: FSEventStreamRef?
     private let callbackQueue: DispatchQueue
@@ -109,6 +124,15 @@ public actor ClaudeDirectoryMonitor: CodingAgentDirectoryMonitor {
     public func startMonitoring() async {
         guard !isMonitoring else { return }
 
+        // Defensive guard: a previous stopMonitoring() call finished the
+        // continuation.  The fileEvents AsyncStream cannot be revived; callers
+        // that cycled through stop→start must create a new monitor instance.
+        // Prefer pause()/resume() to avoid this.
+        guard fileEventContinuation != nil else {
+            Self.logger.warning("startMonitoring() called after stopMonitoring() exhausted the fileEvents continuation — use pause()/resume() to temporarily suspend, or create a new instance to restart from scratch")
+            return
+        }
+
         let validPaths = monitoredPaths.filter { url in
             FileManager.default.fileExists(atPath: url.path)
         }
@@ -135,9 +159,56 @@ public actor ClaudeDirectoryMonitor: CodingAgentDirectoryMonitor {
 
         teardownFSEventStream()
         isMonitoring = false
+        isPaused = false
         fileEventContinuation?.finish()
+        fileEventContinuation = nil
 
         Self.logger.info("Stopped monitoring")
+    }
+
+    /// Temporarily suspends FSEvents delivery without finishing the `fileEvents`
+    /// stream.  Cancels any pending debounce work.
+    ///
+    /// - No-op if not currently monitoring (`isMonitoring == false`).
+    /// - No-op if already paused (`isPaused == true`).
+    public func pause() async {
+        guard isMonitoring, !isPaused else { return }
+
+        debounceTask?.cancel()
+        debounceTask = nil
+
+        teardownFSEventStream()
+        isPaused = true
+
+        Self.logger.debug("Directory monitor paused")
+    }
+
+    /// Reinstalls the FSEvents source after a ``pause()``.
+    ///
+    /// Does **not** run an initial parse pass — the monitor resumes exactly
+    /// where it left off and will react to the next file-system event.
+    ///
+    /// - No-op if not currently monitoring (`isMonitoring == false`).
+    /// - No-op if not paused (`isPaused == false`).
+    public func resume() async {
+        guard isMonitoring, isPaused else { return }
+
+        let validPaths = monitoredPaths.filter { url in
+            FileManager.default.fileExists(atPath: url.path)
+        }
+
+        guard !validPaths.isEmpty else {
+            Self.logger.warning("No monitored paths exist on resume — staying paused")
+            return
+        }
+
+        installFSEventStream(paths: validPaths)
+        if eventStream != nil {
+            isPaused = false
+            Self.logger.debug("Directory monitor resumed")
+        } else {
+            Self.logger.error("FSEventStream reinstall failed on resume — staying paused")
+        }
     }
 
     // MARK: - FSEvents stream
